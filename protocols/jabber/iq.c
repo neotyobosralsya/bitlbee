@@ -26,6 +26,7 @@
 
 static xt_status jabber_parse_roster(struct im_connection *ic, struct xt_node *node, struct xt_node *orig);
 static xt_status jabber_iq_display_vcard(struct im_connection *ic, struct xt_node *node, struct xt_node *orig);
+static xt_status jabber_gmail_handle_new(struct im_connection *ic, struct xt_node *node);
 static int jabber_iq_disco_server(struct im_connection *ic);
 
 xt_status jabber_pkt_iq(struct xt_node *node, gpointer data)
@@ -141,6 +142,10 @@ xt_status jabber_pkt_iq(struct xt_node *node, gpointer data)
 		    (s = xt_find_attr(c, "xmlns")) &&
 		    (strcmp(s, XMLNS_SI) == 0)) {
 			return jabber_si_handle_request(ic, node, c);
+		} else if ((c = xt_find_node(node->children, "new-mail")) &&
+		           (s = xt_find_attr(c, "xmlns")) &&
+		           (strcmp(s, XMLNS_GMAILNOTIFY) == 0)) {
+			return jabber_gmail_handle_new(ic, node);
 		} else if (!(c = xt_find_node(node->children, "query")) ||
 		           !(s = xt_find_attr(c, "xmlns"))) {
 			return XT_HANDLED;
@@ -342,6 +347,9 @@ xt_status jabber_pkt_bind_sess(struct im_connection *ic, struct xt_node *node, s
 		if (!jabber_write_packet(ic, reply)) {
 			return XT_ABORT;
 		}
+		if (jd->flags & JFLAG_GMAILNOTIFY && node == NULL) {
+			jabber_iq_query_server(ic, jd->server, XMLNS_DISCO_INFO);
+		}
 	} else if ((jd->flags & (JFLAG_WANT_BIND | JFLAG_WANT_SESSION)) == 0) {
 		if (!jabber_get_roster(ic)) {
 			return XT_ABORT;
@@ -369,6 +377,25 @@ int jabber_get_roster(struct im_connection *ic)
 	st = jabber_write_packet(ic, node);
 
 	return st;
+}
+
+xt_status jabber_iq_query_gmail(struct im_connection *ic);
+
+static xt_status jabber_gmail_handle_new(struct im_connection *ic, struct xt_node *node)
+{
+	struct xt_node *response;
+	struct jabber_data *jd = ic->proto_data;
+
+	response = jabber_make_packet("iq", "result", g_strdup_printf("%s@%s", jd->username, jd->server), NULL);
+
+	jabber_cache_add(ic, response, NULL);
+	if (!jabber_write_packet(ic, response)) {
+		return XT_ABORT;
+	}
+
+	jabber_iq_query_gmail(ic);
+
+	return XT_HANDLED;
 }
 
 static xt_status jabber_parse_roster(struct im_connection *ic, struct xt_node *node, struct xt_node *orig)
@@ -702,6 +729,32 @@ xt_status jabber_iq_parse_features(struct im_connection *ic, struct xt_node *nod
 	return XT_HANDLED;
 }
 
+xt_status jabber_iq_parse_gmail(struct im_connection *ic, struct xt_node *node, struct xt_node *orig);
+
+xt_status jabber_iq_query_gmail(struct im_connection *ic)
+{
+	struct xt_node *node, *query;
+	struct jabber_data *jd = ic->proto_data;
+
+	node = xt_new_node("query", NULL, NULL);
+	xt_add_attr(node, "xmlns", XMLNS_GMAILNOTIFY);
+	if (jd->gmail_time) {
+		xt_add_attr(node, "newer-than-time", g_strdup_printf("%llu", (jd->gmail_time + 1)));
+	}
+	if (jd->gmail_tid) {
+		xt_add_attr(node, "newer-than-tid", jd->gmail_tid);
+	}
+
+	if (!(query = jabber_make_packet("iq", "get", g_strdup_printf("%s@%s", jd->username, jd->server), node))) {
+		imcb_log(ic, "WARNING: Couldn't generate server query");
+		xt_free_node(node);
+	}
+
+	jabber_cache_add(ic, query, jabber_iq_parse_gmail);
+
+	return jabber_write_packet(ic, query) ? XT_HANDLED : XT_ABORT;
+}
+
 xt_status jabber_iq_parse_server_features(struct im_connection *ic, struct xt_node *node, struct xt_node *orig);
 
 xt_status jabber_iq_query_server(struct im_connection *ic, char *jid, char *xmlns)
@@ -721,6 +774,62 @@ xt_status jabber_iq_query_server(struct im_connection *ic, char *jid, char *xmln
 	jabber_cache_add(ic, query, jabber_iq_parse_server_features);
 
 	return jabber_write_packet(ic, query) ? XT_HANDLED : XT_ABORT;
+}
+
+xt_status jabber_iq_parse_gmail(struct im_connection *ic, struct xt_node *node, struct xt_node *orig)
+{
+	struct xt_node *c;
+	struct jabber_data *jd = ic->proto_data;
+	char *xmlns, *from;
+
+	if (!(c = xt_find_node(node->children, "mailbox")) ||
+	    !(from = xt_find_attr(node, "from")) ||
+	    !(xmlns = xt_find_attr(c, "xmlns"))) {
+		imcb_log(ic, "WARNING: Received incomplete mailbox packet for gmail notify");
+		return XT_HANDLED;
+	}
+	if (strcmp(xmlns, XMLNS_GMAILNOTIFY) == 0) {
+		unsigned long long l_time = 0;
+		char *tid = NULL;
+		c = c->children;
+
+		while ((c = xt_find_node(c, "mail-thread-info"))) {
+			char *subject, *snippet, *msg;
+			struct xt_node *thread;
+			unsigned long long t_time;
+
+			t_time = strtoull(xt_find_attr(c, "date"), NULL, 10);
+			if (t_time && t_time > l_time) {
+				l_time = t_time;
+				tid = xt_find_attr(c, "tid");
+			}
+
+			thread = c->children;
+			subject = xt_find_node(thread, "subject")->text;
+			snippet = xt_find_node(thread, "snippet")->text;
+			if (subject) {
+				msg = g_strdup_printf("New mail for %s. Subj: %s", from, subject);
+			} else {
+				msg = g_strdup_printf("New mail for %s.", from);
+			}
+			imcb_notify_email(ic, set_getstr(&ic->acc->set, "notify_handle"), msg, 0, 0);
+
+			if (snippet) {
+				imcb_notify_email(ic, set_getstr(&ic->acc->set, "notify_handle"), snippet, 0, 0);
+			}
+
+			c = c->next;
+			g_free(msg);
+		}
+		if (l_time && (!jd->gmail_time || l_time > jd->gmail_time)) {
+			jd->gmail_time = l_time;
+			if (tid) {
+				jd->gmail_tid = g_strdup(tid);
+			}
+		}
+	}
+
+	return XT_HANDLED;
 }
 
 /*
@@ -773,6 +882,19 @@ xt_status jabber_iq_parse_server_features(struct im_connection *ic, struct xt_no
 
 			c = c->next;
 		}
+
+		if (jd->flags & JFLAG_GMAILNOTIFY) {
+			/* search for gmail notification feature */
+			c = xt_find_node(node->children, "query");
+			c = c->children;
+			while ((c = xt_find_node(c, "feature"))) {
+				if (strcmp(xt_find_attr(c, "var"), XMLNS_GMAILNOTIFY) == 0) {
+					jabber_iq_query_gmail(ic);
+				}
+				c = c->next;
+			}
+		}
+
 	} else if (strcmp(xmlns, XMLNS_BYTESTREAMS) == 0) {
 		char *host, *jid, *port_s;
 		int port;
