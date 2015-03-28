@@ -101,7 +101,7 @@ struct jabber_data {
 	   presence_send_update() to inform the server about the changes. */
 	const struct jabber_away_state *away_state;
 	char *away_message;
-	unsigned long long gmail_time;
+	guint64 gmail_time;
 	char *gmail_tid;
 
 	md5_state_t cached_id_prefix;

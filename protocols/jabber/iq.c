@@ -739,13 +739,15 @@ xt_status jabber_iq_query_gmail(struct im_connection *ic)
 	node = xt_new_node("query", NULL, NULL);
 	xt_add_attr(node, "xmlns", XMLNS_GMAILNOTIFY);
 	if (jd->gmail_time) {
-		xt_add_attr(node, "newer-than-time", g_strdup_printf("%llu", (jd->gmail_time + 1)));
+		char *formatted = g_strdup_printf("%" G_GUINT64_FORMAT, (jd->gmail_time + 1));
+		xt_add_attr(node, "newer-than-time", formatted);
+		g_free(formatted);
 	}
 	if (jd->gmail_tid) {
 		xt_add_attr(node, "newer-than-tid", jd->gmail_tid);
 	}
 
-	if (!(query = jabber_make_packet("iq", "get", g_strdup_printf("%s@%s", jd->username, jd->server), node))) {
+	if (!(query = jabber_make_packet("iq", "get", jd->me, node))) {
 		imcb_log(ic, "WARNING: Couldn't generate server query");
 		xt_free_node(node);
 	}
@@ -789,24 +791,33 @@ xt_status jabber_iq_parse_gmail(struct im_connection *ic, struct xt_node *node, 
 		return XT_HANDLED;
 	}
 	if (strcmp(xmlns, XMLNS_GMAILNOTIFY) == 0) {
-		unsigned long long l_time = 0;
+		guint64 l_time = 0;
 		char *tid = NULL;
 		c = c->children;
 
 		while ((c = xt_find_node(c, "mail-thread-info"))) {
-			char *subject, *snippet, *msg;
-			struct xt_node *thread;
-			unsigned long long t_time;
+			struct xt_node *thread, *s;
+			char *subject = NULL;
+			char *snippet = NULL;
+			char *msg = NULL;
+			guint64 t_time;
 
-			t_time = strtoull(xt_find_attr(c, "date"), NULL, 10);
+			t_time = g_ascii_strtoull(xt_find_attr(c, "date"), NULL, 10);
 			if (t_time && t_time > l_time) {
 				l_time = t_time;
 				tid = xt_find_attr(c, "tid");
 			}
 
 			thread = c->children;
-			subject = xt_find_node(thread, "subject")->text;
-			snippet = xt_find_node(thread, "snippet")->text;
+
+			if ((s = xt_find_node(thread, "subject"))) {
+				subject = s->text;
+			}
+
+			if ((s = xt_find_node(thread, "snippet"))) {
+				snippet = s->text;
+			}
+
 			if (subject) {
 				msg = g_strdup_printf("New mail for %s. Subj: %s", from, subject);
 			} else {
@@ -824,6 +835,7 @@ xt_status jabber_iq_parse_gmail(struct im_connection *ic, struct xt_node *node, 
 		if (l_time && (!jd->gmail_time || l_time > jd->gmail_time)) {
 			jd->gmail_time = l_time;
 			if (tid) {
+				g_free(jd->gmail_tid);
 				jd->gmail_tid = g_strdup(tid);
 			}
 		}

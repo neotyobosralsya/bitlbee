@@ -960,9 +960,7 @@ void ext_yahoo_mail_notify(int id, const char *from, const char *subj, int cnt)
 	struct im_connection *ic = byahoo_get_ic_by_id(id);
 	char *msg;
 
-	if (!set_getbool(&ic->acc->set, "mail_notifications")) {
-		; /* The user doesn't care. */
-	} else {
+	if (set_getbool(&ic->acc->set, "mail_notifications")) {
 		if (from && subj) {
 			msg = g_strdup_printf("Received e-mail message from %s with subject `%s'", from, subj);
 		} else if (cnt > 0) {
