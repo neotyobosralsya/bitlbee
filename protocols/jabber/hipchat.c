@@ -45,13 +45,9 @@ xt_status hipchat_handle_success(struct im_connection *ic, struct xt_node *node)
 	/* Hipchat's auth doesn't expect a restart here */
 	jd->flags &= ~JFLAG_STREAM_RESTART;
 
-	if (!jabber_get_roster(ic)) {
-		return XT_ABORT;
-	}
-	if (!jabber_iq_disco_server(ic)) {
-		return XT_ABORT;
-	}
-	if (!jabber_get_hipchat_profile(ic)) {
+	if (!jabber_get_roster(ic) ||
+	    !jabber_iq_disco_server(ic) ||
+	    !jabber_get_hipchat_profile(ic)) {
 		return XT_ABORT;
 	}
 
