@@ -29,7 +29,6 @@
 
 int msn_chat_id;
 GSList *msn_connections;
-GSList *msn_switchboards;
 
 static char *set_eval_display_name(set_t *set, char *value);
 
@@ -46,10 +45,7 @@ static void msn_init(account_t *acc)
 	s = set_add(&acc->set, "port", MSN_NS_PORT, set_eval_int, acc);
 	s->flags |= ACC_SET_OFFLINE_ONLY;
 
-	set_add(&acc->set, "switchboard_keepalives", "false", set_eval_bool, acc);
-
-	s = set_add(&acc->set, "mail_notifications", "false", set_eval_bool, acc);
-	s->flags |= ACC_SET_OFFLINE_ONLY;
+	set_add(&acc->set, "mail_notifications", "false", set_eval_bool, acc);
 
 	s = set_add(&acc->set, "notify_handle", NULL, NULL, acc);
 	s->flags |= ACC_SET_OFFLINE_ONLY | SET_NULL_OK;
@@ -68,11 +64,7 @@ static void msn_login(account_t *acc)
 	ic->flags |= OPT_PONGS | OPT_PONGED;
 
 	if (!server) {
-		imcb_error(ic, "The msn protocol is disabled in this version because most servers disabled MSNP18 over port 1863.");
-		imcb_error(ic, "If you find a working server, you can change the 'server' setting of this account. Good luck!");
-		imcb_error(ic, "See also: http://ismsndeadyet.com/"); // shameless plug
-		imc_logout(ic, FALSE);
-		return;
+		server = "geo.gateway.messenger.live.com";
 	}
 
 	if (strchr(acc->user, '@') == NULL) {
@@ -84,12 +76,13 @@ static void msn_login(account_t *acc)
 	md->ic = ic;
 	md->away_state = msn_away_state_list;
 	md->domaintree = g_tree_new(msn_domaintree_cmp);
-	md->ns->fd = -1;
+	md->fd = -1;
+	md->is_http = TRUE;
 
 	msn_connections = g_slist_prepend(msn_connections, ic);
 
 	imcb_log(ic, "Connecting");
-	msn_ns_connect(ic, md->ns, server,
+	msn_ns_connect(ic, server,
 	               set_getint(&ic->acc->set, "port"));
 
 	if (set_getbool(&acc->set, "mail_notification") && set_getstr(&acc->set, "notify_handle")) {
@@ -104,19 +97,8 @@ static void msn_logout(struct im_connection *ic)
 	int i;
 
 	if (md) {
-		/** Disabling MSN ft support for now.
-		while( md->filetransfers ) {
-		        imcb_file_canceled( md->filetransfers->data, "Closing connection" );
-		}
-		*/
+		msn_ns_close(md);
 
-		msn_ns_close(md->ns);
-
-		while (md->switchboards) {
-			msn_sb_destroy(md->switchboards->data);
-		}
-
-		msn_msgq_purge(ic, &md->msgq);
 		msn_soapq_flush(ic, FALSE);
 
 		for (i = 0; i < sizeof(md->tokens) / sizeof(md->tokens[0]); i++) {
@@ -168,29 +150,15 @@ static void msn_logout(struct im_connection *ic)
 static int msn_buddy_msg(struct im_connection *ic, char *who, char *message, int away)
 {
 	struct bee_user *bu = bee_user_by_handle(ic->bee, ic, who);
-	struct msn_buddy_data *bd = bu ? bu->data : NULL;
-	struct msn_switchboard *sb;
 
 #ifdef DEBUG
 	if (strcmp(who, "raw") == 0) {
 		msn_ns_write(ic, -1, "%s\r\n", message);
-	} else
-#endif
-	if (bd && bd->flags & MSN_BUDDY_FED) {
-		msn_ns_sendmessage(ic, bu, message);
-	} else if ((sb = msn_sb_by_handle(ic, who))) {
-		return(msn_sb_sendmessage(sb, message));
-	} else {
-		struct msn_message *m;
-
-		/* Create a message. We have to arrange a usable switchboard, and send the message later. */
-		m = g_new0(struct msn_message, 1);
-		m->who = g_strdup(who);
-		m->text = g_strdup(message);
-
-		return msn_sb_write_msg(ic, m);
+		return 0;
 	}
+#endif
 
+	msn_ns_sendmessage(ic, bu, message);
 	return(0);
 }
 
@@ -212,8 +180,8 @@ static GList *msn_away_states(struct im_connection *ic)
 
 static void msn_set_away(struct im_connection *ic, char *state, char *message)
 {
-	char *uux;
 	struct msn_data *md = ic->proto_data;
+	char *nick, *psm, *idle, *statecode, *body, *buf;
 
 	if (state == NULL) {
 		md->away_state = msn_away_state_list;
@@ -221,32 +189,23 @@ static void msn_set_away(struct im_connection *ic, char *state, char *message)
 		md->away_state = msn_away_state_list + 1;
 	}
 
-	if (!msn_ns_write(ic, -1, "CHG %d %s %d:%02d\r\n", ++md->trId, md->away_state->code, MSN_CAP1, MSN_CAP2)) {
-		return;
-	}
+	statecode = (char *) md->away_state->code;
+	nick = set_getstr(&ic->acc->set, "display_name");
+	psm = message ? message : "";
+	idle = (strcmp(statecode, "IDL") == 0) ? "false" : "true";
 
-	uux = g_markup_printf_escaped("<EndpointData><Capabilities>%d:%02d"
-	                              "</Capabilities></EndpointData>",
-	                              MSN_CAP1, MSN_CAP2);
-	msn_ns_write(ic, -1, "UUX %d %zd\r\n%s", ++md->trId, strlen(uux), uux);
-	g_free(uux);
+	body = g_markup_printf_escaped(MSN_PUT_USER_BODY,
+		nick, psm, psm, md->uuid, statecode, md->uuid, idle, statecode,
+		MSN_CAP1, MSN_CAP2, MSN_CAP1, MSN_CAP2
+	);
 
-	uux = g_markup_printf_escaped("<PrivateEndpointData><EpName>%s</EpName>"
-	                              "<Idle>%s</Idle><ClientType>%d</ClientType>"
-	                              "<State>%s</State></PrivateEndpointData>",
-	                              md->uuid,
-	                              strcmp(md->away_state->code, "IDL") ? "false" : "true",
-	                              1,  /* ? */
-	                              md->away_state->code);
-	msn_ns_write(ic, -1, "UUX %d %zd\r\n%s", ++md->trId, strlen(uux), uux);
-	g_free(uux);
+	buf = g_strdup_printf(MSN_PUT_HEADERS, ic->acc->user, ic->acc->user, md->uuid,
+		"/user", "application/user+xml",
+		strlen(body), body);
+	msn_ns_write(ic, -1, "PUT %d %zd\r\n%s", ++md->trId, strlen(buf), buf);
 
-	uux = g_markup_printf_escaped("<Data><DDP></DDP><PSM>%s</PSM>"
-	                              "<CurrentMedia></CurrentMedia>"
-	                              "<MachineGuid>%s</MachineGuid></Data>",
-	                              message ? message : "", md->uuid);
-	msn_ns_write(ic, -1, "UUX %d %zd\r\n%s", ++md->trId, strlen(uux), uux);
-	g_free(uux);
+	g_free(buf);
+	g_free(body);
 }
 
 static void msn_get_info(struct im_connection *ic, char *who)
@@ -272,53 +231,24 @@ static void msn_remove_buddy(struct im_connection *ic, char *who, char *group)
 
 static void msn_chat_msg(struct groupchat *c, char *message, int flags)
 {
-	struct msn_switchboard *sb = msn_sb_by_chat(c);
-
-	if (sb) {
-		msn_sb_sendmessage(sb, message);
-	}
-	/* FIXME: Error handling (although this can't happen unless something's
-	   already severely broken) disappeared here! */
+	/* TODO: groupchats*/
 }
 
 static void msn_chat_invite(struct groupchat *c, char *who, char *message)
 {
-	struct msn_switchboard *sb = msn_sb_by_chat(c);
-
-	if (sb) {
-		msn_sb_write(sb, "CAL %d %s\r\n", ++sb->trId, who);
-	}
+	/* TODO: groupchats*/
 }
 
 static void msn_chat_leave(struct groupchat *c)
 {
-	struct msn_switchboard *sb = msn_sb_by_chat(c);
-
-	if (sb) {
-		msn_sb_write(sb, "OUT\r\n");
-	}
+	/* TODO: groupchats*/
 }
 
 static struct groupchat *msn_chat_with(struct im_connection *ic, char *who)
 {
-	struct msn_switchboard *sb;
+	/* TODO: groupchats*/
 	struct groupchat *c = imcb_chat_new(ic, who);
-
-	if ((sb = msn_sb_by_handle(ic, who))) {
-		debug("Converting existing switchboard to %s to a groupchat", who);
-		return msn_sb_to_chat(sb);
-	} else {
-		struct msn_message *m;
-
-		/* Create a magic message. This is quite hackish, but who cares? :-P */
-		m = g_new0(struct msn_message, 1);
-		m->who = g_strdup(who);
-		m->text = g_strdup(GROUPCHAT_SWITCHBOARD_MESSAGE);
-
-		msn_sb_write_msg(ic, m);
-
-		return c;
-	}
+	return c;
 }
 
 static void msn_keepalive(struct im_connection *ic)
@@ -338,14 +268,7 @@ static void msn_rem_permit(struct im_connection *ic, char *who)
 
 static void msn_add_deny(struct im_connection *ic, char *who)
 {
-	struct msn_switchboard *sb;
-
 	msn_buddy_list_add(ic, MSN_BUDDY_BL, who, who, NULL);
-
-	/* If there's still a conversation with this person, close it. */
-	if ((sb = msn_sb_by_handle(ic, who))) {
-		msn_sb_destroy(sb);
-	}
 }
 
 static void msn_rem_deny(struct im_connection *ic, char *who)
@@ -477,8 +400,6 @@ void msn_initmodule()
 	ret->buddy_data_free = msn_buddy_data_free;
 	ret->buddy_action_list = msn_buddy_action_list;
 	ret->buddy_action = msn_buddy_action;
-
-	//ret->transfer_request = msn_ftp_transfer_request;
 
 	register_protocol(ret);
 }
